@@ -5,7 +5,11 @@
 //
 // Hardware: ESP32-S3 Supermini + INMP441 I2S mic + MAX98357A I2S amp + speaker.
 // The mic and the amp SHARE the BCLK and WS clock lines — one I2S port runs
-// full-duplex (RX from mic, TX to amp) at 16 kHz.
+// full-duplex (RX channel from mic, TX channel to amp) at 16 kHz.
+//
+// Written for the ESP32 Arduino core 3.x (new i2s_std API).
+// Compile-verified against core 3.3.12 for ESP32-S3 (Oct 2026).
+// Not yet run on hardware — first bring-up will need level/tuning.
 //
 // Wiring (Supermini pin numbers — verify against your specific board!):
 //   INMP441: VDD->3V3, GND->GND, SD->GPIO6, WS->GPIO5, SCK->GPIO4, L/R->GND
@@ -13,32 +17,33 @@
 //              BCLK->GPIO4, LRCK->GPIO5, SD->GPIO11 (pull high = enable)
 //   Buttons: one leg -> GPIO8/9/10, other leg -> GND (uses internal pull-ups,
 //            no resistors needed). Avoid GPIO0 (boot) and GPIO19/20 (USB).
-//
-// NOTE: untested on hardware yet — first bring-up will need level/tuning.
 
-#include <driver/i2s.h>
+#include <driver/i2s_std.h>
 #include <math.h>
 
 // ---------- pins ----------
-#define I2S_BCLK    4
-#define I2S_WS      5
-#define I2S_DIN     6    // mic -> ESP32
-#define I2S_DOUT    7    // ESP32 -> amp
-#define AMP_SD      11   // amp shutdown, HIGH = on
-#define BTN_CHIPMUNK 8
-#define BTN_DEMON    9
-#define BTN_ROBOT    10
+#define I2S_BCLK     GPIO_NUM_4
+#define I2S_WS       GPIO_NUM_5
+#define I2S_DIN      GPIO_NUM_6    // mic -> ESP32
+#define I2S_DOUT     GPIO_NUM_7    // ESP32 -> amp
+#define AMP_SD       GPIO_NUM_11   // amp shutdown, HIGH = on
+#define BTN_CHIPMUNK GPIO_NUM_8
+#define BTN_DEMON    GPIO_NUM_9
+#define BTN_ROBOT    GPIO_NUM_10
 
 // ---------- audio ----------
 #define SAMPLE_RATE   16000
 #define CHUNK         1600               // 100 ms of audio per chunk
-#define I2S_PORT      I2S_NUM_0
 #define MIC_GAIN      3                  // digital gain, tune to taste
 
 // ---------- modes ----------
 enum Mode { CHIPMUNK, DEMON, ROBOT };
 volatile Mode currentMode = CHIPMUNK;
 const char* modeName[] = { "CHIPMUNK", "DEMON", "ROBOT" };
+
+// ---------- i2s channels ----------
+static i2s_chan_handle_t tx_chan = NULL; // ESP32 -> amp
+static i2s_chan_handle_t rx_chan = NULL; // mic -> ESP32
 
 // ---------- buffers ----------
 static int32_t rxBuf32[CHUNK];           // raw 32-bit from mic
@@ -97,11 +102,12 @@ int16_t robotSample(int16_t s) {
 }
 
 // ---------- buttons (internal pull-ups, active LOW) ----------
-struct Button { uint8_t pin; uint32_t lastMs; bool lastState; };
+struct Button { gpio_num_t pin; uint32_t lastMs; bool lastState; };
 Button buttons[3] = {
   { BTN_CHIPMUNK, 0, HIGH }, { BTN_DEMON, 0, HIGH }, { BTN_ROBOT, 0, HIGH }
 };
 Mode buttonMode[3] = { CHIPMUNK, DEMON, ROBOT };
+static uint32_t muteUntil = 0;   // non-blocking pop suppression
 
 void pollButtons() {
   uint32_t now = millis();
@@ -112,13 +118,16 @@ void pollButtons() {
       buttons[i].lastState = s;
       if (s == LOW) {
         currentMode = buttonMode[i];
-        // pop suppression: mute the amp for 30 ms across the switch
+        // pop suppression: mute the amp briefly across the switch
         digitalWrite(AMP_SD, LOW);
-        delay(30);
-        digitalWrite(AMP_SD, HIGH);
+        muteUntil = now + 30;
         Serial.printf("mode -> %s\n", modeName[currentMode]);
       }
     }
+  }
+  if (muteUntil && (int32_t)(now - muteUntil) >= 0) {
+    digitalWrite(AMP_SD, HIGH);
+    muteUntil = 0;
   }
 }
 
@@ -138,42 +147,40 @@ void setup() {
   for (int i = 0; i < CARRIER_N; i++)
     carrier[i] = (int16_t)(32767.0f * sinf(2.0f * M_PI * i / CARRIER_N));
 
-  i2s_config_t cfg = {
-    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX | I2S_MODE_TX),
-    .sample_rate = SAMPLE_RATE,
-    .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
-    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,   // mic L/R tied to GND
-    .communication_format = I2S_COMM_FORMAT_STAND_I2S,
-    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-    .dma_buf_count = 4,
-    .dma_buf_len = 512,
-    .use_apll = false,
-    .tx_desc_auto_clear = true,
-    .fixed_mclk = 0
+  // one I2S port, full duplex: TX channel -> amp, RX channel <- mic
+  i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+  ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, &tx_chan, &rx_chan));
+
+  i2s_std_config_t std_cfg = {
+    .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(SAMPLE_RATE),
+    .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT,
+                                                    I2S_SLOT_MODE_MONO),
+    .gpio_cfg = {
+      .mclk = I2S_GPIO_UNUSED,
+      .bclk = I2S_BCLK,
+      .ws   = I2S_WS,
+      .dout = I2S_DOUT,
+      .din  = I2S_DIN,
+    },
   };
-  i2s_pin_config_t pins = {
-    .bck_io_num = I2S_BCLK,
-    .ws_io_num = I2S_WS,
-    .data_out_num = I2S_DOUT,
-    .data_in_num = I2S_DIN
-  };
-  i2s_driver_install(I2S_PORT, &cfg, 0, NULL);
-  i2s_set_pin(I2S_PORT, &pins);
-  i2s_set_clk(I2S_PORT, SAMPLE_RATE, I2S_BITS_PER_SAMPLE_32BIT, I2S_CHANNEL_MONO);
+  ESP_ERROR_CHECK(i2s_channel_init_std_mode(tx_chan, &std_cfg));
+  ESP_ERROR_CHECK(i2s_channel_init_std_mode(rx_chan, &std_cfg));
+  ESP_ERROR_CHECK(i2s_channel_enable(tx_chan));
+  ESP_ERROR_CHECK(i2s_channel_enable(rx_chan));
 
   Serial.printf("mode -> %s\n", modeName[currentMode]);
 }
 
 // ---------- main loop ----------
-uint32_t lastVuMs = 0;
-int16_t vuPeak = 0;
+static uint32_t lastVuMs = 0;
+static int16_t vuPeak = 0;
 
 void loop() {
   pollButtons();
 
   // 1. read one chunk from the mic
   size_t bytesRead = 0;
-  i2s_read(I2S_PORT, rxBuf32, sizeof(rxBuf32), &bytesRead, portMAX_DELAY);
+  i2s_channel_read(rx_chan, rxBuf32, sizeof(rxBuf32), &bytesRead, portMAX_DELAY);
   int n = bytesRead / 4;
   for (int i = 0; i < n; i++) {
     workBuf[i] = micTo16(rxBuf32[i]);
@@ -197,7 +204,7 @@ void loop() {
   // 3. write to the amp
   for (int i = 0; i < outN; i++) txBuf32[i] = toAmp(workBuf[i]);
   size_t bytesWritten = 0;
-  i2s_write(I2S_PORT, txBuf32, outN * 4, &bytesWritten, portMAX_DELAY);
+  i2s_channel_write(tx_chan, txBuf32, outN * 4, &bytesWritten, portMAX_DELAY);
 
   // VU meter on serial: peak input level twice a second.
   // Silent mic reads ~0-500, normal speech 3k-15k, clipping at 32767.
@@ -214,11 +221,11 @@ void loop() {
   // 4. demon mode plays slower than the mic records: drain the backlog
   //    so the next chunk starts fresh instead of lagging further behind.
   if (currentMode == DEMON) {
-    size_t extra = (outN - n) * 4;
+    size_t extra = (outN > n ? outN - n : 0) * 4;
     static int32_t drain[256];
     while (extra > 0) {
       size_t got = 0, want = extra > sizeof(drain) ? sizeof(drain) : extra;
-      i2s_read(I2S_PORT, drain, want, &got, 0);
+      i2s_channel_read(rx_chan, drain, want, &got, 0);
       if (got == 0) break;
       extra -= got;
     }
