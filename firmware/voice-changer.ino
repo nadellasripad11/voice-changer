@@ -1,6 +1,6 @@
 // voice-changer.ino — Week 3: Music Week (Half Life)
 // Talk into the mic, hear yourself back transformed.
-//   Button 1 -> CHIPMUNK (2x pitch up)   Button 2 -> DEMON (0.5x pitch down)
+//   Button 1 -> CHIPMUNK (pitch up 2x)   Button 2 -> DEMON (pitch down 0.5x)
 //   Button 3 -> ROBOT (ring modulation)
 //
 // Hardware: ESP32-S3 Supermini + INMP441 I2S mic + MAX98357A I2S amp + speaker.
@@ -11,12 +11,23 @@
 // Compile-verified against core 3.3.12 for ESP32-S3 (Oct 2026).
 // Not yet run on hardware — first bring-up will need level/tuning.
 //
+// Arduino IDE settings (Tools menu) for the Supermini's native USB:
+//   USB CDC On Boot -> Enabled   (needed for Serial output + easy uploads)
+//
 // Wiring (Supermini pin numbers — verify against your specific board!):
 //   INMP441: VDD->3V3, GND->GND, SD->GPIO6, WS->GPIO5, SCK->GPIO4, L/R->GND
 //   MAX98357A: VIN->5V (or 3V3, quieter), GND->GND, DIN->GPIO7,
 //              BCLK->GPIO4, LRCK->GPIO5, SD->GPIO11 (pull high = enable)
 //   Buttons: one leg -> GPIO8/9/10, other leg -> GND (uses internal pull-ups,
 //            no resistors needed). Avoid GPIO0 (boot) and GPIO19/20 (USB).
+//
+// How the effects work:
+//   CHIPMUNK/DEMON: overlap-add pitch shifter. The incoming audio is kept in
+//   a ring buffer; each output grain is a resampled slice of the input
+//   (faster = higher pitch, slower = lower pitch) and overlapping grains are
+//   crossfaded with a Hann window. Smooth, no stutter, ~30-80 ms latency.
+//   ROBOT: real-time ring modulation — the voice is multiplied by a 30 Hz
+//   sine wave. Zero extra latency.
 
 #include <driver/i2s_std.h>
 #include <math.h>
@@ -33,28 +44,21 @@
 
 // ---------- audio ----------
 #define SAMPLE_RATE   16000
-#define CHUNK         1600               // 100 ms of audio per chunk
+#define I2S_PORT      I2S_NUM_0
 #define MIC_GAIN      3                  // digital gain, tune to taste
 
-// ---------- modes ----------
-enum Mode { CHIPMUNK, DEMON, ROBOT };
-volatile Mode currentMode = CHIPMUNK;
-const char* modeName[] = { "CHIPMUNK", "DEMON", "ROBOT" };
+// ---------- pitch shifter ----------
+#define GRAIN   512                      // output grain length (samples)
+#define HOP     256                      // output hop (50% overlap -> Hann COLA)
+#define RING_N  8192                     // ring buffer (512 ms), must be power of 2
+#define RING_M  (RING_N - 1)
 
-// ---------- i2s channels ----------
-static i2s_chan_handle_t tx_chan = NULL; // ESP32 -> amp
-static i2s_chan_handle_t rx_chan = NULL; // mic -> ESP32
-
-// ---------- buffers ----------
-static int32_t rxBuf32[CHUNK];           // raw 32-bit from mic
-static int16_t workBuf[CHUNK * 2];       // 16-bit working space (demon needs 2x)
-static int32_t txBuf32[CHUNK * 2];       // 32-bit to amp
-
-// robot voice: 30 Hz sine table for ring modulation (classic Dalek-ish effect)
-#define CARRIER_N 256
-static int16_t carrier[CARRIER_N];
-static float carrierPhase = 0;
-const float CARRIER_STEP = 30.0f * CARRIER_N / SAMPLE_RATE;
+static int16_t ringBuf[RING_N];
+static uint32_t writePos = 0;            // monotonic input sample counter
+static float readPos = 0;                // monotonic input position for grains
+static float olaBuf[GRAIN + HOP];
+static float hannWin[GRAIN];
+static bool shifterSync = true;          // true -> re-sync readPos on next grain
 
 static inline int16_t clamp16(int32_t v) {
   if (v > 32767) return 32767;
@@ -62,11 +66,53 @@ static inline int16_t clamp16(int32_t v) {
   return (int16_t)v;
 }
 
+// linear-interpolated read from the ring buffer at a fractional position
+static inline float ringRead(float pos) {
+  int32_t i0 = (int32_t)pos;
+  float frac = pos - (float)i0;
+  int16_t a = ringBuf[i0 & RING_M];
+  int16_t b = ringBuf[(i0 + 1) & RING_M];
+  return a + (b - a) * frac;
+}
+
+// Produce HOP output samples at pitch factor P (2.0 = chipmunk, 0.5 = demon).
+// Reads a resampled window of the input and overlap-adds it into olaBuf.
+static void pitchGrain(float P, int16_t* out) {
+  float winLen = GRAIN * P;
+  // make sure we have enough buffered input; if not, re-sync
+  if ((float)writePos - readPos < winLen + HOP) {
+    readPos = (float)writePos - (winLen + HOP);
+    for (int i = 0; i < GRAIN + HOP; i++) olaBuf[i] = 0;
+  }
+  for (int i = 0; i < GRAIN; i++)
+    olaBuf[i] += ringRead(readPos + (float)i * P) * hannWin[i];
+  for (int i = 0; i < HOP; i++) {
+    out[i] = clamp16((int32_t)olaBuf[i]);
+    olaBuf[i] = olaBuf[i + HOP];
+  }
+  for (int i = GRAIN; i < GRAIN + HOP; i++) olaBuf[i] = 0;
+  readPos += HOP;
+}
+
+// ---------- modes ----------
+enum Mode { CHIPMUNK, DEMON, ROBOT };
+volatile Mode currentMode = CHIPMUNK;
+const char* modeName[] = { "CHIPMUNK", "DEMON", "ROBOT" };
+const float modePitch[] = { 2.0f, 0.5f, 1.0f };  // robot ignores pitch
+
+// ---------- i2s channels ----------
+static i2s_chan_handle_t tx_chan = NULL; // ESP32 -> amp
+static i2s_chan_handle_t rx_chan = NULL; // mic -> ESP32
+
+// robot voice: 30 Hz sine table for ring modulation
+#define CARRIER_N 256
+static int16_t carrier[CARRIER_N];
+static float carrierPhase = 0;
+const float CARRIER_STEP = 30.0f * CARRIER_N / SAMPLE_RATE;
+
 // INMP441 sends 24-bit audio left-justified in a 32-bit frame.
-// Shift down to 16-bit and apply a little gain.
 static inline int16_t micTo16(int32_t raw) {
-  int32_t s = (raw >> 14) * MIC_GAIN;
-  return clamp16(s);
+  return clamp16((raw >> 14) * MIC_GAIN);
 }
 
 // MAX98357A accepts 16-bit left-justified in a 32-bit frame.
@@ -74,27 +120,7 @@ static inline int32_t toAmp(int16_t s) {
   return ((int32_t)s) << 16;
 }
 
-// CHIPMUNK: play the chunk back at 2x speed (every 2nd sample).
-// Pitch AND speed double — the classic tape-trick voice changer.
-// Returns number of output samples (CHUNK/2).
-int chipmunk(int16_t* in, int16_t* out, int n) {
-  int o = 0;
-  for (int i = 0; i < n; i += 2) out[o++] = in[i];
-  return o;
-}
-
-// DEMON: play the chunk back at half speed (each sample twice).
-// Returns number of output samples (CHUNK*2). The mic keeps recording
-// while we play slow, so the caller drains the extra input afterwards.
-int demon(int16_t* in, int16_t* out, int n) {
-  int o = 0;
-  for (int i = 0; i < n; i++) { out[o++] = in[i]; out[o++] = in[i]; }
-  return o;
-}
-
-// ROBOT: ring modulation — multiply the voice by a 30 Hz sine wave.
-// Runs sample-by-sample in real time, no extra latency.
-int16_t robotSample(int16_t s) {
+static inline int16_t robotSample(int16_t s) {
   int idx = ((int)carrierPhase) & (CARRIER_N - 1);
   carrierPhase += CARRIER_STEP;
   if (carrierPhase >= CARRIER_N) carrierPhase -= CARRIER_N;
@@ -118,8 +144,8 @@ void pollButtons() {
       buttons[i].lastState = s;
       if (s == LOW) {
         currentMode = buttonMode[i];
-        // pop suppression: mute the amp briefly across the switch
-        digitalWrite(AMP_SD, LOW);
+        shifterSync = true;              // re-sync pitch shifter on switch
+        digitalWrite(AMP_SD, LOW);        // mute briefly: no pops
         muteUntil = now + 30;
         Serial.printf("mode -> %s\n", modeName[currentMode]);
       }
@@ -142,12 +168,13 @@ void setup() {
   pinMode(BTN_DEMON, INPUT_PULLUP);
   pinMode(BTN_ROBOT, INPUT_PULLUP);
   pinMode(AMP_SD, OUTPUT);
-  digitalWrite(AMP_SD, HIGH);  // enable amp
+  digitalWrite(AMP_SD, HIGH);
 
   for (int i = 0; i < CARRIER_N; i++)
     carrier[i] = (int16_t)(32767.0f * sinf(2.0f * M_PI * i / CARRIER_N));
+  for (int i = 0; i < GRAIN; i++)       // periodic Hann: exact COLA at 50%
+    hannWin[i] = 0.5f * (1.0f - cosf(2.0f * M_PI * i / GRAIN));
 
-  // one I2S port, full duplex: TX channel -> amp, RX channel <- mic
   i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
   ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, &tx_chan, &rx_chan));
 
@@ -174,60 +201,56 @@ void setup() {
 // ---------- main loop ----------
 static uint32_t lastVuMs = 0;
 static int16_t vuPeak = 0;
+static int32_t rxTmp[HOP];
+static int16_t in16[HOP];
+static int16_t out16[HOP];
+static int32_t tx32[HOP];
 
 void loop() {
   pollButtons();
 
-  // 1. read one chunk from the mic
-  size_t bytesRead = 0;
-  i2s_channel_read(rx_chan, rxBuf32, sizeof(rxBuf32), &bytesRead, portMAX_DELAY);
-  int n = bytesRead / 4;
-  for (int i = 0; i < n; i++) {
-    workBuf[i] = micTo16(rxBuf32[i]);
-    int16_t a = workBuf[i] >= 0 ? workBuf[i] : -workBuf[i];
-    if (a > vuPeak) vuPeak = a;
+  // 1. read exactly HOP samples from the mic
+  int got = 0;
+  while (got < HOP) {
+    size_t br = 0;
+    i2s_channel_read(rx_chan, rxTmp, (HOP - got) * 4, &br, portMAX_DELAY);
+    int cnt = br / 4;
+    for (int i = 0; i < cnt; i++) {
+      in16[got + i] = micTo16(rxTmp[i]);
+      int16_t a = in16[got + i] >= 0 ? in16[got + i] : -in16[got + i];
+      if (a > vuPeak) vuPeak = a;
+    }
+    got += cnt;
   }
 
-  // 2. apply the effect
-  int outN = 0;
   if (currentMode == ROBOT) {
-    for (int i = 0; i < n; i++) workBuf[i] = robotSample(workBuf[i]);
-    outN = n;
-  } else if (currentMode == CHIPMUNK) {
-    outN = chipmunk(workBuf, workBuf, n);          // in-place, shrinks
+    // real-time ring modulation, no buffering
+    for (int i = 0; i < HOP; i++) out16[i] = robotSample(in16[i]);
   } else {
-    static int16_t stretched[CHUNK * 2];
-    outN = demon(workBuf, stretched, n);
-    for (int i = 0; i < outN; i++) workBuf[i] = stretched[i];
+    // pitch shift via overlap-add
+    for (int i = 0; i < HOP; i++) ringBuf[(writePos + i) & RING_M] = in16[i];
+    writePos += HOP;
+    if (shifterSync) {                       // fresh start after mode switch
+      readPos = (float)writePos - (GRAIN * modePitch[currentMode] + HOP);
+      for (int i = 0; i < GRAIN + HOP; i++) olaBuf[i] = 0;
+      shifterSync = false;
+    }
+    pitchGrain(modePitch[currentMode], out16);
   }
 
-  // 3. write to the amp
-  for (int i = 0; i < outN; i++) txBuf32[i] = toAmp(workBuf[i]);
-  size_t bytesWritten = 0;
-  i2s_channel_write(tx_chan, txBuf32, outN * 4, &bytesWritten, portMAX_DELAY);
+  // 2. write to the amp
+  for (int i = 0; i < HOP; i++) tx32[i] = toAmp(out16[i]);
+  size_t bw = 0;
+  i2s_channel_write(tx_chan, tx32, sizeof(tx32), &bw, portMAX_DELAY);
 
-  // VU meter on serial: peak input level twice a second.
-  // Silent mic reads ~0-500, normal speech 3k-15k, clipping at 32767.
+  // VU meter: peak input level twice a second
   uint32_t now = millis();
   if (now - lastVuMs > 500) {
     lastVuMs = now;
-    int bars = vuPeak / 2048;                 // 0..16
+    int bars = vuPeak / 2048;
     Serial.print("in [");
     for (int b = 0; b < 16; b++) Serial.print(b < bars ? '#' : '-');
     Serial.printf("] %d\n", vuPeak);
     vuPeak = 0;
-  }
-
-  // 4. demon mode plays slower than the mic records: drain the backlog
-  //    so the next chunk starts fresh instead of lagging further behind.
-  if (currentMode == DEMON) {
-    size_t extra = (outN > n ? outN - n : 0) * 4;
-    static int32_t drain[256];
-    while (extra > 0) {
-      size_t got = 0, want = extra > sizeof(drain) ? sizeof(drain) : extra;
-      i2s_channel_read(rx_chan, drain, want, &got, 0);
-      if (got == 0) break;
-      extra -= got;
-    }
   }
 }
