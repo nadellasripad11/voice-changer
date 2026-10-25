@@ -112,3 +112,9 @@ voice-changer/
 │   └── schematic-mic.png
 └── README.md
 ```
+
+## Schematic
+
+![Full schematic](media/schematic-full.png)
+
+![ESP32-S3 section](media/schematic-esp32.png)
