@@ -37,9 +37,9 @@ all parts from aliexpress, free shipping.
 | MAX98357A I2S amp, 2-pack already welded (AliExpress) | 1 | $6.05 |
 | INMP441 I2S mic, pre-soldered (AliExpress) | 1 | $5.55 |
 | YUXI 4Ω 3W speaker pair (AliExpress) | 1 | $5.33 |
-| tactile button kit (AliExpress) | 1 | $1.09 |
-| MB-102 breadboard + jumper wires (AliExpress) | 1 | $4.38 |
-| **total** | | **$31.96** |
+| tactile button kit (AliExpress) | 1 | $4.94 |
+| MB-102 breadboard + jumper wires (AliExpress) | 1 | $1.09 |
+| **total** | | **$32.52** |
 
 ## wiring
 
